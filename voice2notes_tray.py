@@ -1,9 +1,10 @@
 import os
+import re
 import sys
 import threading
 import time
 import wave
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import sounddevice as sd
@@ -18,10 +19,9 @@ CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
 REMINDER_SECONDS = 5 * 60
 DEFAULT_MODEL_NAME = "medium"
-TRANSCRIPTION_CPU_THREADS = 6
+TRANSCRIPTION_CPU_THREADS = 8
 INITIAL_PROMPT = (
-    "Trascrizione di una conversazione tecnica di informatica, programmazione Python, "
-    "cybersecurity, terminale, comandi pip, macchine virtuali e sviluppo software."
+    "Questo è un audio in italiano che contiene termini tecnici di informatica in inglese e spagnolo."
 )
 
 
@@ -72,6 +72,7 @@ class Voice2NotesTrayApp:
 
         self.current_session_dir: Path | None = None
         self.current_wav_path: Path | None = None
+        self.current_recording_started_at: datetime | None = None
 
     def run(self) -> None:
         self.icon.run()
@@ -98,6 +99,7 @@ class Voice2NotesTrayApp:
 
             self.current_session_dir = session_dir
             self.current_wav_path = wav_path
+            self.current_recording_started_at = datetime.now()
             self.stop_recording_event.clear()
             self.stop_notifier_event.clear()
             self.is_recording = True
@@ -128,6 +130,7 @@ class Voice2NotesTrayApp:
             self.is_transcribing = True
             wav_path = self.current_wav_path
             session_dir = self.current_session_dir
+            recording_started_at = self.current_recording_started_at
 
         self.stop_recording_event.set()
         self.stop_notifier_event.set()
@@ -135,7 +138,7 @@ class Voice2NotesTrayApp:
 
         threading.Thread(
             target=self._finalize_and_transcribe_worker,
-            args=(wav_path, session_dir),
+            args=(wav_path, session_dir, recording_started_at),
             daemon=True,
             name="transcriber",
         ).start()
@@ -203,7 +206,12 @@ class Voice2NotesTrayApp:
                 session_name = self.current_session_dir.name if self.current_session_dir else "sessione corrente"
             self._show_notification("Registrazione ancora attiva", f"Sto ancora registrando: {session_name}")
 
-    def _finalize_and_transcribe_worker(self, wav_path: Path | None, session_dir: Path | None) -> None:
+    def _finalize_and_transcribe_worker(
+        self,
+        wav_path: Path | None,
+        session_dir: Path | None,
+        recording_started_at: datetime | None,
+    ) -> None:
         try:
             if self.recording_thread and self.recording_thread.is_alive():
                 self.recording_thread.join(timeout=15)
@@ -212,7 +220,7 @@ class Voice2NotesTrayApp:
                 raise RuntimeError("File audio non trovato dopo lo stop.")
 
             self._show_notification("Trascrizione avviata", "Elaborazione offline in corso...")
-            transcript = self._transcribe_file(wav_path)
+            transcript = self._transcribe_file(wav_path, recording_started_at)
             transcript_path = session_dir / "trascrizione.txt"
             transcript_path.write_text(transcript.strip() + "\n", encoding="utf-8")
             self._show_notification("Trascrizione completata", f"Creato {transcript_path.name}")
@@ -225,9 +233,10 @@ class Voice2NotesTrayApp:
                 self.is_transcribing = False
                 self.current_wav_path = None
                 self.current_session_dir = None
+                self.current_recording_started_at = None
             self.icon.update_menu()
 
-    def _transcribe_file(self, wav_path: Path) -> str:
+    def _transcribe_file(self, wav_path: Path, recording_started_at: datetime | None) -> str:
         model_path = self._resolve_model_source()
         model = WhisperModel(
             str(model_path) if isinstance(model_path, Path) else model_path,
@@ -240,9 +249,72 @@ class Voice2NotesTrayApp:
             language="it",
             beam_size=5,
             vad_filter=True,
+            temperature=0.0, # nuovo
             initial_prompt=INITIAL_PROMPT,
         )
-        return "\n".join(segment.text.strip() for segment in segments if segment.text.strip())
+        transcript_lines = []
+        fallback_started_at = recording_started_at or datetime.now()
+        pending_separator = False
+
+        for segment in segments:
+            text = segment.text.strip()
+            if not text:
+                continue
+
+            segment_started_at = fallback_started_at + timedelta(seconds=segment.start)
+            timestamp = segment_started_at.strftime("%Y-%m-%d %H:%M:%S")
+            formatted_lines, pending_separator = self._format_transcript_segment(
+                text,
+                timestamp,
+                pending_separator,
+            )
+            transcript_lines.extend(formatted_lines)
+
+        return "\n".join(transcript_lines)
+
+    def _format_transcript_segment(
+        self,
+        text: str,
+        timestamp: str,
+        pending_separator: bool = False,
+    ) -> tuple[list[str], bool]:
+        lines: list[str] = []
+        parts = re.split(r"(?i)\bnuovo blocco\b", text)
+
+        for index, raw_part in enumerate(parts):
+            part = raw_part.strip(" \t,;:.!?-")
+
+            if pending_separator and part:
+                lines.append("---")
+                pending_separator = False
+
+            if part:
+                lines.append(self._apply_voice_macro_format(part, timestamp))
+
+            if index < len(parts) - 1:
+                pending_separator = True
+
+        return lines, pending_separator
+
+    def _apply_voice_macro_format(self, text: str, timestamp: str) -> str:
+        note_match = re.match(r"(?i)^(nota|attenzione)\s*:\s*(.+)$", text)
+        if note_match:
+            label = note_match.group(1).upper()
+            body = note_match.group(2).strip()
+            emoji = "⚠️" if label == "ATTENZIONE" else "📝"
+            return f"[{timestamp}] > {emoji} **{label}:** {body}"
+
+        task_match = re.match(r"(?i)^(task|promemoria)\s*:\s*(.+)$", text)
+        if task_match:
+            body = task_match.group(2).strip()
+            return f"[{timestamp}] - [ ] {body}"
+
+        todo_match = re.match(r"(?i)^to\s*do\b\s*:?\s*(.+)$", text)
+        if todo_match:
+            body = todo_match.group(1).strip()
+            return f"[{timestamp}] - [ ] {body}"
+
+        return f"[{timestamp}] {text}"
 
     def _resolve_model_source(self) -> Path | str:
         override = os.environ.get("VOICE2NOTES_MODEL_DIR")
