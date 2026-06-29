@@ -1,0 +1,17 @@
+# Ambienti virtuali
+venv/
+.venv/
+env/
+
+# Cache di Python e file compilati
+__pycache__/
+*.pyc
+
+# Cartelle di build di PyInstaller
+build/
+dist/
+*.spec
+
+# File di configurazione IDE (se usi VS Code o PyCharm)
+.vscode/
+.idea/
